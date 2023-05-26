@@ -102,9 +102,9 @@ static int __init rshm_init(void)
     // Initialize shash API
     err = crypto_shash_init(desc);
 
-    total_time = 0;
     for (i = 1; i <= 1000000; i *= 10)
     {
+        total_time = 0;
         for (j = 0; j < i; j++)
         {
             // clear data and digest
