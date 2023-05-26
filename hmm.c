@@ -1,10 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * This is a module to test the HMM (Heterogeneous Memory Management)
- * mirror and zone device private memory migration APIs of the kernel.
- * Userspace programs can register with the driver to mirror their own address
- * space and can use the device to read/write any valid virtual address.
- */
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -29,34 +22,53 @@
 #include <linux/rmap.h>
 #include <linux/mmu_notifier.h>
 #include <linux/migrate.h>
+#include <linux/types.h>
+#include <linux/ioctl.h>
 
-#include "test_hmm_uapi.h"
+
+struct hmm_dmirror_cmd {
+	__u64		addr;
+	__u64		ptr;
+	__u64		npages;
+	__u64		cpages;
+	__u64		faults;
+};
+
+#define HMM_DMIRROR_READ		_IOWR('H', 0x00, struct hmm_dmirror_cmd)
+#define HMM_DMIRROR_WRITE		_IOWR('H', 0x01, struct hmm_dmirror_cmd)
+#define HMM_DMIRROR_MIGRATE_TO_DEV	_IOWR('H', 0x02, struct hmm_dmirror_cmd)
+#define HMM_DMIRROR_MIGRATE_TO_SYS	_IOWR('H', 0x03, struct hmm_dmirror_cmd)
+#define HMM_DMIRROR_SNAPSHOT		_IOWR('H', 0x04, struct hmm_dmirror_cmd)
+#define HMM_DMIRROR_EXCLUSIVE		_IOWR('H', 0x05, struct hmm_dmirror_cmd)
+#define HMM_DMIRROR_CHECK_EXCLUSIVE	_IOWR('H', 0x06, struct hmm_dmirror_cmd)
+#define HMM_DMIRROR_RELEASE		_IOWR('H', 0x07, struct hmm_dmirror_cmd)
+
+enum {
+	HMM_DMIRROR_PROT_ERROR			= 0xFF,
+	HMM_DMIRROR_PROT_NONE			= 0x00,
+	HMM_DMIRROR_PROT_READ			= 0x01,
+	HMM_DMIRROR_PROT_WRITE			= 0x02,
+	HMM_DMIRROR_PROT_PMD			= 0x04,
+	HMM_DMIRROR_PROT_PUD			= 0x08,
+	HMM_DMIRROR_PROT_ZERO			= 0x10,
+	HMM_DMIRROR_PROT_DEV_PRIVATE_LOCAL	= 0x20,
+	HMM_DMIRROR_PROT_DEV_PRIVATE_REMOTE	= 0x30,
+	HMM_DMIRROR_PROT_DEV_COHERENT_LOCAL	= 0x40,
+	HMM_DMIRROR_PROT_DEV_COHERENT_REMOTE	= 0x50,
+};
+
+enum {
+	/* 0 is reserved to catch uninitialized type fields */
+	HMM_DMIRROR_MEMORY_DEVICE_PRIVATE = 1,
+	HMM_DMIRROR_MEMORY_DEVICE_COHERENT,
+};
 
 #define DMIRROR_NDEVICES		4
 #define DMIRROR_RANGE_FAULT_TIMEOUT	1000
 #define DEVMEM_CHUNK_SIZE		(256 * 1024 * 1024U)
 #define DEVMEM_CHUNKS_RESERVE		16
 
-/*
- * For device_private pages, dpage is just a dummy struct page
- * representing a piece of device memory. dmirror_devmem_alloc_page
- * allocates a real system memory page as backing storage to fake a
- * real device. zone_device_data points to that backing page. But
- * for device_coherent memory, the struct page represents real
- * physical CPU-accessible memory that we can use directly.
- */
-#define BACKING_PAGE(page) (is_device_private_page((page)) ? \
-			   (page)->zone_device_data : (page))
-
-static unsigned long spm_addr_dev0;
-module_param(spm_addr_dev0, long, 0644);
-MODULE_PARM_DESC(spm_addr_dev0,
-		"Specify start address for SPM (special purpose memory) used for device 0. By setting this Coherent device type will be used. Make sure spm_addr_dev1 is set too. Minimum SPM size should be DEVMEM_CHUNK_SIZE.");
-
-static unsigned long spm_addr_dev1;
-module_param(spm_addr_dev1, long, 0644);
-MODULE_PARM_DESC(spm_addr_dev1,
-		"Specify start address for SPM (special purpose memory) used for device 1. By setting this Coherent device type will be used. Make sure spm_addr_dev0 is set too. Minimum SPM size should be DEVMEM_CHUNK_SIZE.");
+#define BACKING_PAGE(page) (is_device_private_page((page)) ? (page)->zone_device_data : (page))
 
 static const struct dev_pagemap_ops dmirror_devmem_ops;
 static const struct mmu_interval_notifier_ops dmirror_min_ops;
@@ -119,7 +131,7 @@ struct dmirror_device {
 	unsigned long		calloc;
 	unsigned long		cfree;
 	struct page		*free_pages;
-	spinlock_t		lock;		/* protects the above */
+	spinlock_t		;		/* protects the above */
 };
 
 static struct dmirror_device dmirror_devices[DMIRROR_NDEVICES];
@@ -511,28 +523,15 @@ static int dmirror_allocate_chunk(struct dmirror_device *mdevice,
 	if (!devmem)
 		return ret;
 
-	switch (mdevice->zone_device_type) {
-	case HMM_DMIRROR_MEMORY_DEVICE_PRIVATE:
-		res = request_free_mem_region(&iomem_resource, DEVMEM_CHUNK_SIZE,
-					      "hmm_dmirror");
-		if (IS_ERR_OR_NULL(res))
-			goto err_devmem;
-		devmem->pagemap.range.start = res->start;
-		devmem->pagemap.range.end = res->end;
-		devmem->pagemap.type = MEMORY_DEVICE_PRIVATE;
-		break;
-	case HMM_DMIRROR_MEMORY_DEVICE_COHERENT:
-		devmem->pagemap.range.start = (MINOR(mdevice->cdevice.dev) - 2) ?
-							spm_addr_dev0 :
-							spm_addr_dev1;
-		devmem->pagemap.range.end = devmem->pagemap.range.start +
-					    DEVMEM_CHUNK_SIZE - 1;
-		devmem->pagemap.type = MEMORY_DEVICE_COHERENT;
-		break;
-	default:
-		ret = -EINVAL;
+
+	res = request_free_mem_region(&iomem_resource, DEVMEM_CHUNK_SIZE,
+						"hmm_dmirror");
+	if (IS_ERR_OR_NULL(res))
 		goto err_devmem;
-	}
+	devmem->pagemap.range.start = res->start;
+	devmem->pagemap.range.end = res->end;
+	devmem->pagemap.type = MEMORY_DEVICE_PRIVATE;
+
 
 	devmem->pagemap.nr_range = 1;
 	devmem->pagemap.ops = &dmirror_devmem_ops;
@@ -762,7 +761,8 @@ static int dmirror_migrate_finalize_and_map(struct migrate_vma *args,
 		if (!(*src & MIGRATE_PFN_MIGRATE))
 			continue;
 
-		dpage = z(*dst);
+		
+		 = migrate_pfn_to_page(*dst);
 		if (!dpage)
 			continue;
 
@@ -1373,33 +1373,9 @@ static long dmirror_fops_unlocked_ioctl(struct file *filp,
 	return 0;
 }
 
-static int dmirror_fops_mmap(struct file *file, struct vm_area_struct *vma)
-{
-	unsigned long addr;
-
-	for (addr = vma->vm_start; addr < vma->vm_end; addr += PAGE_SIZE) {
-		struct page *page;
-		int ret;
-
-		page = alloc_page(GFP_KERNEL | __GFP_ZERO);
-		if (!page)
-			return -ENOMEM;
-
-		ret = vm_insert_page(vma, addr, page);
-		if (ret) {
-			__free_page(page);
-			return ret;
-		}
-		put_page(page);
-	}
-
-	return 0;
-}
-
 static const struct file_operations dmirror_fops = {
 	.open		= dmirror_fops_open,
 	.release	= dmirror_fops_release,
-	.mmap		= dmirror_fops_mmap,
 	.unlocked_ioctl = dmirror_fops_unlocked_ioctl,
 	.llseek		= default_llseek,
 	.owner		= THIS_MODULE,
@@ -1459,11 +1435,7 @@ static vm_fault_t dmirror_devmem_fault(struct vm_fault *vmf)
 	if (ret)
 		return ret;
 	migrate_vma_pages(&args);
-	/*
-	 * No device finalize step is needed since
-	 * dmirror_devmem_fault_alloc_and_copy() will have already
-	 * invalidated the device page table.
-	 */
+	
 	migrate_vma_finalize(&args);
 	return 0;
 }
@@ -1505,28 +1477,19 @@ static void dmirror_device_remove(struct dmirror_device *mdevice)
 	cdev_device_del(&mdevice->cdevice, &mdevice->device);
 }
 
-static int __init 	(void)
+static int __init rshm_init(void)
 {
 	int ret;
 	int id = 0;
 	int ndevices = 0;
 
-	ret = alloc_chrdev_region(&dmirror_dev, 0, DMIRROR_NDEVICES,
-				  "HMM_DMIRROR");
+	ret = alloc_chrdev_region(&dmirror_dev, 0, DMIRROR_NDEVICES, "HMM_DMIRROR");
 	if (ret)
 		goto err_unreg;
 
 	memset(dmirror_devices, 0, DMIRROR_NDEVICES * sizeof(dmirror_devices[0]));
-	dmirror_devices[ndevices++].zone_device_type =
-				HMM_DMIRROR_MEMORY_DEVICE_PRIVATE;
-	dmirror_devices[ndevices++].zone_device_type =
-				HMM_DMIRROR_MEMORY_DEVICE_PRIVATE;
-	if (spm_addr_dev0 && spm_addr_dev1) {
-		dmirror_devices[ndevices++].zone_device_type =
-					HMM_DMIRROR_MEMORY_DEVICE_COHERENT;
-		dmirror_devices[ndevices++].zone_device_type =
-					HMM_DMIRROR_MEMORY_DEVICE_COHERENT;
-	}
+	dmirror_devices[ndevices++].zone_device_type =	HMM_DMIRROR_MEMORY_DEVICE_PRIVATE;
+	dmirror_devices[ndevices++].zone_device_type =	HMM_DMIRROR_MEMORY_DEVICE_PRIVATE;
 	for (id = 0; id < ndevices; id++) {
 		ret = dmirror_device_init(dmirror_devices + id, id);
 		if (ret)
@@ -1544,7 +1507,7 @@ err_unreg:
 	return ret;
 }
 
-static void __exit hmm_dmirror_exit(void)
+static void __exit rshm_exit(void)
 {
 	int id;
 
@@ -1554,6 +1517,6 @@ static void __exit hmm_dmirror_exit(void)
 	unregister_chrdev_region(dmirror_dev, DMIRROR_NDEVICES);
 }
 
-module_init(hmm_dmirror_init);
-module_exit(hmm_dmirror_exit);
+module_init(rshm_init);
+module_exit(rshm_exit);
 MODULE_LICENSE("GPL");
